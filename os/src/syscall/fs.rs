@@ -1,5 +1,4 @@
 //! File and filesystem-related syscalls
-
 const FD_STDOUT: usize = 1;
 
 /// write buf of length `len`  to a file with `fd`

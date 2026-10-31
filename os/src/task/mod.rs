@@ -14,12 +14,14 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use core::panic;
+
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
 use lazy_static::*;
 use switch::__switch;
-pub use task::{TaskControlBlock, TaskStatus};
+pub use task::{TaskControlBlock, TaskStatus, TaskInfo};
 
 pub use context::TaskContext;
 
@@ -43,6 +45,8 @@ pub struct TaskManager {
 pub struct TaskManagerInner {
     /// task list
     tasks: [TaskControlBlock; MAX_APP_NUM],
+    /// task info list
+    tasks_info: [TaskInfo; MAX_APP_NUM],
     /// id of current `Running` task
     current_task: usize,
 }
@@ -55,6 +59,7 @@ lazy_static! {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
         }; MAX_APP_NUM];
+        let tasks_info = [TaskInfo { syscall_times: [0usize; 5], syscall_id: [0usize; 5] }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
@@ -64,6 +69,7 @@ lazy_static! {
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
+                    tasks_info,
                     current_task: 0,
                 })
             },
@@ -115,6 +121,15 @@ impl TaskManager {
             .find(|id| inner.tasks[*id].task_status == TaskStatus::Ready)
     }
 
+    /// Get the number of times the current task has been called.
+    fn get_sys_call_times(&self, id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks_info[current].syscall_id.iter().position(|&a| a == id).map(|a| {
+            inner.tasks_info[current].syscall_times[a]
+        }).unwrap_or(0)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -134,6 +149,26 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Record the syscall id and the number of times the current task has been called.
+    pub fn record_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let task = &mut inner.tasks_info[cur];
+        let Some(index) = task.syscall_id.iter().position(|&v| v == syscall_id ||v == 0) else {
+            panic!("No available slot for syscall_id in record_syscall!");
+        };
+        match task.syscall_id[index] {
+            0 => {
+                task.syscall_id[index] = syscall_id;
+                task.syscall_times[index] = 1;
+            }
+            _ => {
+                task.syscall_times[index] += 1;
+            }
+        }
+        // println!("Task {} called syscall {} for the {} time(s)", inner.current_task, syscall_id, syscall_times[index]);
     }
 }
 
@@ -156,6 +191,11 @@ fn mark_current_suspended() {
 /// Change the status of current `Running` task into `Exited`.
 fn mark_current_exited() {
     TASK_MANAGER.mark_current_exited();
+}
+
+/// Get the number of times the current task has been called.
+pub fn get_sys_call_times(id: usize) -> usize {
+    TASK_MANAGER.get_sys_call_times(id)
 }
 
 /// Suspend the current 'Running' task and run the next task in task list.
