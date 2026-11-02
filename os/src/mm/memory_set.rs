@@ -82,10 +82,13 @@ impl MemorySet {
     /// mmap
     pub fn mmap(&mut self, va_start: VirtAddr, va_end: VirtAddr, perm: MapPermission) -> bool {
         let (s, e) = (va_start.floor(), va_end.ceil());
-        if self.areas.iter().any(|a| a.vpn_range.get_start() >= s && a.vpn_range.get_start() <= e ||
-    a.vpn_range.get_end() >= s && a.vpn_range.get_end() <= e) {
+        if self.areas.iter().any(|a| {
+            a.vpn_range.get_start() < a.vpn_range.get_end()
+                && a.vpn_range.get_start() < e
+                && s < a.vpn_range.get_end()
+        }) {
             return false;
-        };
+        }
         self.push(MapArea::new(va_start, va_end, MapType::Framed, perm), None);
         return true;
     }
