@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{VirtAddr, PhysAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +134,24 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// translate_va_to_pa
+    pub fn translate_va_to_pa(&self, va: usize) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let task_control_block = & inner.tasks[cur];
+        let pt = task_control_block.memory_set.translate(VirtAddr::from(va).floor());
+        match pt {
+            Some(ptable) => {
+                if !ptable.is_valid() || !ptable.writable() {
+                    None
+                } else {
+                    Some(PhysAddr::from(ptable.ppn()).0 + VirtAddr::from(va).page_offset())
+                }
+            },
+            None => None,
+        }
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +220,9 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// translate_va_to_pa
+pub fn translate_va_to_pa(va: usize) -> Option<usize> {
+    TASK_MANAGER.translate_va_to_pa(va)
 }
