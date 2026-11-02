@@ -12,6 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::cmp::{min, max};
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -77,6 +78,93 @@ impl MemorySet {
             PhysAddr::from(strampoline as usize).into(),
             PTEFlags::R | PTEFlags::X,
         );
+    }
+    /// mmap
+    pub fn mmap(&mut self, va_start: VirtAddr, va_end: VirtAddr, perm: MapPermission) -> bool {
+        let (s, e) = (va_start.floor(), va_end.ceil());
+        if self.areas.iter().any(|a| a.vpn_range.get_start() >= s && a.vpn_range.get_start() <= e ||
+    a.vpn_range.get_end() >= s && a.vpn_range.get_end() <= e) {
+            return false;
+        };
+        self.push(MapArea::new(va_start, va_end, MapType::Framed, perm), None);
+        return true;
+    }
+
+    /// 解除 `[va_start, va_end)` 的映射。
+    ///
+    /// 支持跨多个区域,也支持只解除某个区域的一部分;如果范围内有
+    /// 未映射的页,返回 `false` 且不做任何修改。
+    pub fn munmap(&mut self, va_start: VirtAddr, va_end: VirtAddr) -> bool {
+        let s = va_start.floor();
+        let e = va_end.ceil();
+        if s >= e {
+            return false;
+        }
+
+        // 1. 先确认 [s, e) 被已映射区域完整覆盖,避免改到一半才失败
+        let mut ranges: Vec<(VirtPageNum, VirtPageNum)> = self
+            .areas
+            .iter()
+            .filter_map(|a| {
+                let (as_, ae) = (a.vpn_range.get_start(), a.vpn_range.get_end());
+                let lo = max(as_, s);
+                let hi = min(ae, e);
+                if lo < hi {
+                    Some((lo, hi))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ranges.sort_by_key(|(lo, _)| lo.0);
+        let mut covered = s;
+        for (lo, hi) in ranges {
+            if lo > covered {
+                return false; // [s, e) 中间有未映射的洞
+            }
+            if hi > covered {
+                covered = hi;
+            }
+            if covered >= e {
+                break;
+            }
+        }
+        if covered < e {
+            return false;
+        }
+
+        // 2. 逐区域处理:整块被覆盖就整体解除,否则拆分并保留范围外的部分
+        let old_areas = core::mem::take(&mut self.areas);
+        let mut new_areas: Vec<MapArea> = Vec::new();
+        for mut area in old_areas {
+            let (as_, ae) = (area.vpn_range.get_start(), area.vpn_range.get_end());
+            if ae <= s || as_ >= e {
+                // 与 [s, e) 不相交
+                new_areas.push(area);
+            } else if as_ >= s && ae <= e {
+                // 整个 area 都在解除范围内
+                area.unmap(&mut self.page_table);
+            } else if as_ >= s {
+                // 只解除 [as_, e),保留右半 [e, ae)
+                let right = area.split_off(e);
+                area.unmap(&mut self.page_table);
+                new_areas.push(right);
+            } else if ae <= e {
+                // 只解除 [s, ae),保留左半 [as_, s)
+                let mut right = area.split_off(s);
+                right.unmap(&mut self.page_table);
+                new_areas.push(area);
+            } else {
+                // s、e 都落在 area 内部,拆成左/中/右,中间部分解除
+                let right = area.split_off(e);
+                let mut mid = area.split_off(s);
+                mid.unmap(&mut self.page_table);
+                new_areas.push(area);
+                new_areas.push(right);
+            }
+        }
+        self.areas = new_areas;
+        true
     }
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
@@ -354,6 +442,26 @@ impl MapArea {
                 break;
             }
             current_vpn.step();
+        }
+    }
+
+    /// 在 `vpn` 处切开:左半保留在 `self`,右半作为新的 `MapArea` 返回。
+    /// 帧的所有权随区间一起移动。
+    pub fn split_off(&mut self, vpn: VirtPageNum) -> MapArea {
+        let start = self.vpn_range.get_start();
+        let end = self.vpn_range.get_end();
+        let mut right_frames = BTreeMap::new();
+        for v in VPNRange::new(vpn, end) {
+            if let Some(frame) = self.data_frames.remove(&v) {
+                right_frames.insert(v, frame);
+            }
+        }
+        self.vpn_range = VPNRange::new(start, vpn);
+        MapArea {
+            vpn_range: VPNRange::new(vpn, end),
+            data_frames: right_frames,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
         }
     }
 }

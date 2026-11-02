@@ -115,7 +115,7 @@ pub enum TaskStatus {
 #[derive(Copy, Clone)]
 pub struct TaskInfo {
     /// The number of times a syscall has been called by the task, which is used to record the number of times a task has been called.
-    pub syscall_times: [usize; 5],
+    pub syscall_times: [usize; 8],
     /// The syscall id of the task, which is used to record the syscall id of a task.
-    pub syscall_id: [usize; 5],
+    pub syscall_id: [usize; 8],
 }
