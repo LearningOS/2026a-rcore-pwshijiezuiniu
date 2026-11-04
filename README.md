@@ -63,10 +63,9 @@ git switch ch3
 
 ```sh
 git clone https://github.com/LearningOS/rCore-Tutorial-Test.git user
-git -C user checkout a0593662ad55d670ba8c27ce1763347cd0dd552f
 ```
 
-两条命令下载用户程序并选择与课程自动评测相同的版本。已经有 `user/` 时复用该目录，不要重复克隆。
+这条命令下载用户程序。已经有 `user/` 时复用该目录，不要重复克隆。
 
 ```sh
 make -C os run
@@ -98,12 +97,10 @@ make docker
 
 ```sh
 git clone https://github.com/LearningOS/rCore-Tutorial-Checker.git ci-user
-git -C ci-user checkout 7d61ec55b58eed6ca7052917846c1b87af34563a
 git clone https://github.com/LearningOS/rCore-Tutorial-Test.git ci-user/user
-git -C ci-user/user checkout a0593662ad55d670ba8c27ce1763347cd0dd552f
 ```
 
-这些命令准备与课程 CI 相同版本的检查器和测试程序。已有对应目录时复用，不要删除自己的源码或报告。
+这两条命令下载官方检查器和测试程序。已有对应目录时复用，不要删除自己的源码或报告。
 
 ```sh
 make -C ci-user test CHAPTER=3
