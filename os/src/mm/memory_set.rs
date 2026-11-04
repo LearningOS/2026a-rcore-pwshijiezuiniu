@@ -9,6 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::cmp::{max, min};
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -77,6 +78,101 @@ impl MemorySet {
             area.unmap(&mut self.page_table);
             self.areas.remove(idx);
         }
+    }
+    /// map `[va_start, va_end)` as a new framed area.
+    ///
+    /// Returns `false` if the range overlaps any existing area.
+    pub fn mmap(&mut self, va_start: VirtAddr, va_end: VirtAddr, perm: MapPermission) -> bool {
+        let (s, e) = (va_start.floor(), va_end.ceil());
+        if self.areas.iter().any(|a| {
+            a.vpn_range.get_start() < a.vpn_range.get_end()
+                && a.vpn_range.get_start() < e
+                && s < a.vpn_range.get_end()
+        }) {
+            return false;
+        }
+        self.push(MapArea::new(va_start, va_end, MapType::Framed, perm), None);
+        true
+    }
+
+    /// Unmap `[va_start, va_end)`.
+    ///
+    /// Supports ranges spanning multiple areas as well as partially
+    /// unmapping an area. If any page in the range is not mapped, returns
+    /// `false` without modifying anything.
+    pub fn munmap(&mut self, va_start: VirtAddr, va_end: VirtAddr) -> bool {
+        let s = va_start.floor();
+        let e = va_end.ceil();
+        if s >= e {
+            return false;
+        }
+
+        // 1. Make sure [s, e) is fully covered by mapped areas, so that a
+        //    failure cannot leave the memory set half-modified.
+        let mut ranges: Vec<(VirtPageNum, VirtPageNum)> = self
+            .areas
+            .iter()
+            .filter_map(|a| {
+                let (as_, ae) = (a.vpn_range.get_start(), a.vpn_range.get_end());
+                let lo = max(as_, s);
+                let hi = min(ae, e);
+                if lo < hi {
+                    Some((lo, hi))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ranges.sort_by_key(|(lo, _)| lo.0);
+        let mut covered = s;
+        for (lo, hi) in ranges {
+            if lo > covered {
+                return false; // a hole in [s, e)
+            }
+            if hi > covered {
+                covered = hi;
+            }
+            if covered >= e {
+                break;
+            }
+        }
+        if covered < e {
+            return false;
+        }
+
+        // 2. Process area by area: remove fully covered areas, split the
+        //    rest and keep the parts outside [s, e).
+        let old_areas = core::mem::take(&mut self.areas);
+        let mut new_areas: Vec<MapArea> = Vec::new();
+        for mut area in old_areas {
+            let (as_, ae) = (area.vpn_range.get_start(), area.vpn_range.get_end());
+            if ae <= s || as_ >= e {
+                // no overlap with [s, e)
+                new_areas.push(area);
+            } else if as_ >= s && ae <= e {
+                // the whole area is unmapped
+                area.unmap(&mut self.page_table);
+            } else if as_ >= s {
+                // unmap [as_, e), keep [e, ae)
+                let right = area.split_off(e);
+                area.unmap(&mut self.page_table);
+                new_areas.push(right);
+            } else if ae <= e {
+                // unmap [s, ae), keep [as_, s)
+                let mut right = area.split_off(s);
+                right.unmap(&mut self.page_table);
+                new_areas.push(area);
+            } else {
+                // s and e both fall inside the area: split into left/mid/right
+                let right = area.split_off(e);
+                let mut mid = area.split_off(s);
+                mid.unmap(&mut self.page_table);
+                new_areas.push(area);
+                new_areas.push(right);
+            }
+        }
+        self.areas = new_areas;
+        true
     }
     /// Add a new MapArea into this MemorySet.
     /// Assuming that there are no conflicts in the virtual address
@@ -395,6 +491,25 @@ impl MapArea {
             self.map_one(page_table, vpn)
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
+    }
+    /// Split at `vpn`: the left half stays in `self`, the right half is
+    /// returned as a new `MapArea`. Frame ownership moves with the range.
+    pub fn split_off(&mut self, vpn: VirtPageNum) -> MapArea {
+        let start = self.vpn_range.get_start();
+        let end = self.vpn_range.get_end();
+        let mut right_frames = BTreeMap::new();
+        for v in VPNRange::new(vpn, end) {
+            if let Some(frame) = self.data_frames.remove(&v) {
+                right_frames.insert(v, frame);
+            }
+        }
+        self.vpn_range = VPNRange::new(start, vpn);
+        MapArea {
+            vpn_range: VPNRange::new(vpn, end),
+            data_frames: right_frames,
+            map_type: self.map_type,
+            map_perm: self.map_perm,
+        }
     }
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before

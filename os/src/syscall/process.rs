@@ -4,11 +4,12 @@ use alloc::sync::Arc;
 
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{translated_refmut, translated_str, MapPermission, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        suspend_current_and_run_next, TaskControlBlock, BIG_STRIDE,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -105,30 +106,82 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let token = current_user_token();
+    // Write the two fields separately so that a TimeVal crossing a page
+    // boundary is still handled correctly.
+    let sec_ptr = ts as *mut usize;
+    let usec_ptr = unsafe { sec_ptr.add(1) };
+    *translated_refmut(token, sec_ptr) = us / 1_000_000;
+    *translated_refmut(token, usec_ptr) = us % 1_000_000;
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    let va = VirtAddr::from(start);
+    if va.page_offset() != 0 {
+        return -1;
+    }
+    if len == 0 {
+        return -1;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return -1;
+    };
+    if end > (1usize << 38) {
+        return -1; // SV39 user-space upper bound, avoid VirtAddr truncation aliasing
+    }
+    if prot & !0x7 != 0 || prot & 0x7 == 0 {
+        return -1;
+    }
+    let mut perm = MapPermission::U;
+    if prot & 1 == 1 {
+        perm = perm | MapPermission::R;
+    }
+    if prot & 2 == 2 {
+        perm = perm | MapPermission::W;
+    }
+    if prot & 4 == 4 {
+        perm = perm | MapPermission::X;
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.mmap(va, VirtAddr::from(end), perm) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    let va = VirtAddr::from(start);
+    if va.page_offset() != 0 {
+        return -1;
+    }
+    if len == 0 {
+        return -1;
+    }
+    let Some(end) = start.checked_add(len) else {
+        return -1;
+    };
+    if end > (1usize << 38) {
+        return -1; // SV39 user-space upper bound, avoid VirtAddr truncation aliasing
+    }
+
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner.memory_set.munmap(va, VirtAddr::from(end)) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -143,19 +196,34 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let parent = current_task().unwrap();
+        let task = Arc::new(TaskControlBlock::new(all_data.as_slice()));
+        // TaskControlBlock::new is designed for initproc, so set the parent link here
+        task.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+        parent.inner_exclusive_access().children.push(task.clone());
+        let new_pid = task.pid.0;
+        add_task(task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().pid.0
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    current_task().unwrap().inner_exclusive_access().pass = BIG_STRIDE / (prio as usize);
+    prio
 }
