@@ -49,6 +49,16 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// whether deadlock detection is enabled in this process
+    pub deadlock_detect: bool,
+    /// per-thread mutex allocation matrix: `mutex_alloc[tid][mutex_id]`
+    pub mutex_alloc: Vec<Vec<usize>>,
+    /// per-thread mutex need matrix: `mutex_need[tid][mutex_id]`
+    pub mutex_need: Vec<Vec<usize>>,
+    /// per-thread semaphore allocation matrix: `sem_alloc[tid][sem_id]`
+    pub sem_alloc: Vec<Vec<usize>>,
+    /// per-thread semaphore need matrix: `sem_need[tid][sem_id]`
+    pub sem_need: Vec<Vec<usize>>,
 }
 
 impl ProcessControlBlockInner {
@@ -81,6 +91,182 @@ impl ProcessControlBlockInner {
     /// get a task with tid in this process
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
+    }
+    /// Reset all deadlock detection bookkeeping.
+    pub fn deadlock_reset(&mut self) {
+        for row in self.mutex_alloc.iter_mut() {
+            row.fill(0);
+        }
+        for row in self.mutex_need.iter_mut() {
+            row.fill(0);
+        }
+        for row in self.sem_alloc.iter_mut() {
+            row.fill(0);
+        }
+        for row in self.sem_need.iter_mut() {
+            row.fill(0);
+        }
+    }
+    /// Resize the deadlock detection matrices so that `tid` has a row and
+    /// every row covers all currently existing resources.
+    fn deadlock_resize(&mut self, tid: usize) {
+        let mutex_count = self.mutex_list.len();
+        let sem_count = self.semaphore_list.len();
+        while self.mutex_alloc.len() <= tid {
+            self.mutex_alloc.push(Vec::new());
+        }
+        while self.mutex_need.len() <= tid {
+            self.mutex_need.push(Vec::new());
+        }
+        while self.sem_alloc.len() <= tid {
+            self.sem_alloc.push(Vec::new());
+        }
+        while self.sem_need.len() <= tid {
+            self.sem_need.push(Vec::new());
+        }
+        for row in self.mutex_alloc.iter_mut() {
+            row.resize(mutex_count, 0);
+        }
+        for row in self.mutex_need.iter_mut() {
+            row.resize(mutex_count, 0);
+        }
+        for row in self.sem_alloc.iter_mut() {
+            row.resize(sem_count, 0);
+        }
+        for row in self.sem_need.iter_mut() {
+            row.resize(sem_count, 0);
+        }
+    }
+    /// Record that `tid` is about to wait for a mutex and check whether the
+    /// resulting state is safe. The request is reverted when it is unsafe.
+    pub fn deadlock_mutex_request(&mut self, tid: usize, mutex_id: usize) -> bool {
+        self.deadlock_resize(tid);
+        self.mutex_need[tid][mutex_id] = 1;
+        let safe = self.deadlock_mutex_safe();
+        if !safe {
+            self.mutex_need[tid][mutex_id] = 0;
+        }
+        safe
+    }
+    /// Record that `tid` has acquired a mutex.
+    pub fn deadlock_mutex_acquired(&mut self, tid: usize, mutex_id: usize) {
+        self.deadlock_resize(tid);
+        self.mutex_need[tid][mutex_id] = 0;
+        self.mutex_alloc[tid][mutex_id] += 1;
+    }
+    /// Satisfy a pending mutex request when its waiter is woken up.
+    pub fn deadlock_mutex_fulfilled(&mut self, tid: usize, mutex_id: usize) {
+        self.deadlock_resize(tid);
+        if self.mutex_need[tid][mutex_id] > 0 {
+            self.mutex_need[tid][mutex_id] = 0;
+            self.mutex_alloc[tid][mutex_id] += 1;
+        }
+    }
+    /// Record that `tid` has released a mutex.
+    pub fn deadlock_mutex_released(&mut self, tid: usize, mutex_id: usize) {
+        self.deadlock_resize(tid);
+        if self.mutex_alloc[tid][mutex_id] > 0 {
+            self.mutex_alloc[tid][mutex_id] -= 1;
+        }
+    }
+    /// Record that `tid` is about to wait for a semaphore and check whether
+    /// the resulting state is safe. The request is reverted when it is unsafe.
+    pub fn deadlock_sem_request(&mut self, tid: usize, sem_id: usize) -> bool {
+        self.deadlock_resize(tid);
+        self.sem_need[tid][sem_id] = 1;
+        let safe = self.deadlock_sem_safe();
+        if !safe {
+            self.sem_need[tid][sem_id] = 0;
+        }
+        safe
+    }
+    /// Record that `tid` has acquired a unit of a semaphore.
+    pub fn deadlock_sem_acquired(&mut self, tid: usize, sem_id: usize) {
+        self.deadlock_resize(tid);
+        self.sem_need[tid][sem_id] = 0;
+        self.sem_alloc[tid][sem_id] += 1;
+    }
+    /// Satisfy a pending semaphore request when its waiter is woken up.
+    pub fn deadlock_sem_fulfilled(&mut self, tid: usize, sem_id: usize) {
+        self.deadlock_resize(tid);
+        if self.sem_need[tid][sem_id] > 0 {
+            self.sem_need[tid][sem_id] = 0;
+            self.sem_alloc[tid][sem_id] += 1;
+        }
+    }
+    /// Record that `tid` has released a unit of a semaphore.
+    pub fn deadlock_sem_released(&mut self, tid: usize, sem_id: usize) {
+        self.deadlock_resize(tid);
+        if self.sem_alloc[tid][sem_id] > 0 {
+            self.sem_alloc[tid][sem_id] -= 1;
+        }
+    }
+    /// Banker's safety check over all mutexes.
+    fn deadlock_mutex_safe(&self) -> bool {
+        let m = self.mutex_list.len();
+        let work: Vec<usize> = (0..m)
+            .map(|j| match self.mutex_list[j].as_ref() {
+                Some(mutex) if !mutex.is_locked() => 1,
+                _ => 0,
+            })
+            .collect();
+        self.deadlock_finishable(m, work, &self.mutex_alloc, &self.mutex_need)
+    }
+    /// Banker's safety check over all semaphores.
+    fn deadlock_sem_safe(&self) -> bool {
+        let m = self.semaphore_list.len();
+        let work: Vec<usize> = self
+            .semaphore_list
+            .iter()
+            .map(|sem| match sem {
+                Some(sem) => sem.inner.exclusive_access().count.max(0) as usize,
+                None => 0,
+            })
+            .collect();
+        self.deadlock_finishable(m, work, &self.sem_alloc, &self.sem_need)
+    }
+    /// Run the safety algorithm: find an order in which every live task can
+    /// finish using the currently available resources plus the resources
+    /// released by the tasks that finish before it.
+    fn deadlock_finishable(
+        &self,
+        m: usize,
+        mut work: Vec<usize>,
+        alloc: &[Vec<usize>],
+        need: &[Vec<usize>],
+    ) -> bool {
+        let n = self.tasks.len().max(alloc.len()).max(need.len());
+        let mut finish = vec![false; n];
+        loop {
+            let mut progressed = false;
+            for i in 0..n {
+                if finish[i] {
+                    continue;
+                }
+                let live = self.tasks.get(i).map_or(false, |task| task.is_some());
+                if !live {
+                    // Threads that no longer exist have no need and are
+                    // ignored.
+                    finish[i] = true;
+                    continue;
+                }
+                let need_row: &[usize] = need.get(i).map_or(&[], |row| row.as_slice());
+                let can_finish = (0..m).all(|j| need_row.get(j).copied().unwrap_or(0) <= work[j]);
+                if can_finish {
+                    if let Some(alloc_row) = alloc.get(i) {
+                        for j in 0..m {
+                            work[j] += alloc_row.get(j).copied().unwrap_or(0);
+                        }
+                    }
+                    finish[i] = true;
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        finish.iter().all(|finished| *finished)
     }
 }
 
@@ -119,6 +305,11 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_alloc: Vec::new(),
+                    mutex_need: Vec::new(),
+                    sem_alloc: Vec::new(),
+                    sem_need: Vec::new(),
                 })
             },
         });
@@ -245,6 +436,11 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: parent.deadlock_detect,
+                    mutex_alloc: Vec::new(),
+                    mutex_need: Vec::new(),
+                    sem_alloc: Vec::new(),
+                    sem_need: Vec::new(),
                 })
             },
         });
